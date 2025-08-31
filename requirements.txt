@@ -1,0 +1,6 @@
+brotli
+lz4
+zstandard
+pandas
+matplotlib
+seaborn
