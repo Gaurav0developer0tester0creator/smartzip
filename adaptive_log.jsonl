@@ -1,0 +1,3 @@
+{"file": "sample_binary.bin", "type": "application/octet-stream", "algorithm": "SKIP", "original_size": 500000, "compressed_size": 500000, "compression_ratio": 1.0, "comp_time_sec": 0, "decomp_time_sec": 0, "entropy": 7.999645218914156}
+{"file": "sample_json.json", "type": "application/json", "algorithm": "zstd", "original_size": 160000, "compressed_size": 65, "compression_ratio": 0.00040625, "comp_time_sec": 0.0003867149353027344, "decomp_time_sec": 0.00014472007751464844, "entropy": 4.288909765557392}
+{"file": "sample_text.txt", "type": "text/plain", "algorithm": "zstd", "original_size": 160000, "compressed_size": 47, "compression_ratio": 0.00029375, "comp_time_sec": 0.00029349327087402344, "decomp_time_sec": 0.00015211105346679688, "entropy": 3.75}
