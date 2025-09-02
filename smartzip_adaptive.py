@@ -38,158 +38,181 @@ def shannon_entropy(data: bytes) -> float:
             entropy -= p * math.log2(p)
     return entropy
 
-def detect_file_type(file_path: str, data: bytes) -> str:
-    mime, _ = mimetypes.guess_type(file_path)
-    if mime:
-        return mime
-    text_chars = bytearray({7,8,9,10,12,13,27} | set(range(0x20, 0x100)))
-    if all(c in text_chars for c in data[:1000]):
-        return "text/plain"
-    return "application/octet-stream"
+def detect_file_type(file_path: str):
+    mime_type, _ = mimetypes.guess_type(file_path)
+    return mime_type or "application/octet-stream"
 
-# ----------------------
-# Compressors
-# ----------------------
-compressors = {
-    "gzip":   (lambda d: gzip.compress(d),   lambda d: gzip.decompress(d)),
-    "bz2":    (lambda d: bz2.compress(d),    lambda d: bz2.decompress(d)),
-    "lzma":   (lambda d: lzma.compress(d),   lambda d: lzma.decompress(d)),
-    "lz4":    (lambda d: lz4.frame.compress(d), lambda d: lz4.frame.decompress(d)),
-    "zstd":   (
-        lambda d: zstd.ZstdCompressor().compress(d),
-        lambda d: zstd.ZstdDecompressor().decompress(d)
-    ),
-    "brotli": (lambda d: brotli.compress(d), lambda d: brotli.decompress(d)),
-}
+def choose_algorithm(entropy: float, size: int, thresholds=None) -> str:
+    if thresholds is None:
+        thresholds = THRESHOLDS
 
-# ----------------------
-# Adaptive Decision Engine
-# ----------------------
-def choose_algorithm(file_type: str, entropy: float, size: int) -> str:
-    et = THRESHOLDS.get("entropy_threshold", 3.5)
-    st = THRESHOLDS.get("size_threshold", 5_000_000)
-
-    if entropy > 7.5:
-        return "SKIP"
-
-    if "json" in file_type or "text" in file_type:
-        if entropy < et:
-            return "brotli"
-        return "zstd"
-
-    if "audio" in file_type or "video" in file_type or "image" in file_type:
-        if size > st:
-            return "lz4"
-        return "zstd"
-
+    if entropy > thresholds["entropy_threshold"]:
+        return "brotli"
+    elif size > thresholds["size_threshold"]:
+        return "lz4"
     return "zstd"
 
 # ----------------------
-# Auto-Recalibration Logic
+# Adaptive Decision Logic
 # ----------------------
-def auto_recalibrate(log_file="adaptive_log.jsonl"):
-    if not os.path.exists(log_file):
-        return THRESHOLDS, 0.0
+def adaptive_decision(file_info, thresholds=None, auto_recalibrate_enabled=False, window=500):
+    """
+    Decide best algorithm based on entropy and size thresholds.
+    """
+    # Load thresholds
+    if thresholds is None:
+        thresholds = load_thresholds()
 
-    with open(log_file) as f:
-        records = [json.loads(line) for line in f]
+    entropy_threshold = thresholds.get("entropy_threshold", 3.5)
+    size_threshold = thresholds.get("size_threshold", 5_000_000)
 
-    if len(records) < 3:  # Not enough data yet
-        return THRESHOLDS, 0.0
+    # Optional: update thresholds dynamically
+    if auto_recalibrate_enabled:
+        try:
+            from smartzip_dashboard import auto_recalibrate_from_log
+            thresholds = auto_recalibrate_from_log(window=window)
+            if thresholds:
+                entropy_threshold = thresholds["entropy_threshold"]
+                size_threshold = thresholds["size_threshold"]
+        except Exception as e:
+            print("⚠️ Auto-recalibration failed:", e)
 
-    df = records  # simple list of dicts
-    entropy_range = [x/10 for x in range(20, 51)]  # 2.0–5.0
-    size_range = [1_000_000, 5_000_000, 10_000_000, 20_000_000]
+    # --- Decision Logic ---
+    algo = "zstd"   # default
 
-    best_score, best_params = -1, (THRESHOLDS["entropy_threshold"], THRESHOLDS["size_threshold"])
+    if file_info["entropy"] > entropy_threshold:
+        algo = "brotli"
+    elif file_info["size"] > size_threshold:
+        algo = "lz4"
+    elif file_info["size"] < 1000:  # very small files
+        algo = "gzip"
+    elif 1000 <= file_info["size"] <= 100000 and file_info["entropy"] < 2.5:
+        algo = "bz2"
+    elif file_info["entropy"] < 1.5:  # very repetitive data
+        algo = "lzma"
+    else:
+        algo = "zstd"
 
-    for et in entropy_range:
-        for st in size_range:
-            correct = 0
-            for row in df:
-                predicted = choose_algorithm(row["type"], row["entropy"], row["original_size"])
-                if predicted == row["algorithm"]:
-                    correct += 1
-            acc = correct / len(df)
-            if acc > best_score:
-                best_score, best_params = acc, (et, st)
+    decision = {
+        "algo": algo,
+        "entropy_threshold": entropy_threshold,
+        "size_threshold": size_threshold,
+        "file_entropy": file_info.get("entropy"),
+        "file_size": file_info.get("size"),
+        "timestamp": time.time()
+    }
 
-    new_thresholds = {"entropy_threshold": best_params[0], "size_threshold": best_params[1]}
-    save_thresholds(new_thresholds)
-    return new_thresholds, best_score
+    # Optional: log to catalog
+    try:
+        from smartzip_catalog import add_decision_to_catalog
+        add_decision_to_catalog(file_info.get("name", "unknown"), decision)
+    except Exception as e:
+        print("⚠️ Catalog logging failed:", e)
+
+    return decision
 
 # ----------------------
-# Adaptive Compressor
+# Adaptive Compression Wrapper
 # ----------------------
-def adaptive_compress(file_path: str, log_file="adaptive_log.jsonl", recalibrate_every=5):
-    global THRESHOLDS
+def adaptive_compress(file_path: str, thresholds=None, auto_recalibrate_enabled=False):
+    if thresholds is None:
+        thresholds = load_thresholds()
 
     with open(file_path, "rb") as f:
         data = f.read()
 
-    size = len(data)
     entropy = shannon_entropy(data)
-    ftype = detect_file_type(file_path, data)
-    algo = choose_algorithm(ftype, entropy, size)
+    size = len(data)
 
-    if algo == "SKIP":
-        print(f"⚠️  Skipping {file_path} (entropy={entropy:.2f}, looks random).")
-        result = {
-            "file": os.path.basename(file_path),
-            "type": ftype,
-            "algorithm": "SKIP",
-            "original_size": size,
-            "compressed_size": size,
-            "compression_ratio": 1.0,
-            "comp_time_sec": 0,
-            "decomp_time_sec": 0,
-            "entropy": entropy
-        }
-    else:
-        comp, decomp = compressors[algo]
-        start = time.time()
-        compressed = comp(data)
-        comp_time = time.time() - start
+    file_info = {"name": os.path.basename(file_path), "entropy": entropy, "size": size}
+    decision = adaptive_decision(file_info, thresholds, auto_recalibrate_enabled)
 
-        start = time.time()
-        restored = decomp(compressed)
-        decomp_time = time.time() - start
-        assert restored == data, "Decompression failed!"
+    algo = decision["algo"]
+    compressed = None
 
-        ratio = len(compressed) / size
-        print(f"✅ {file_path} | Algo={algo} | Entropy={entropy:.2f} | Ratio={ratio:.4f} "
-              f"(Thresholds: {THRESHOLDS})")
+    if algo == "zstd":
+        compressed = zstd.ZstdCompressor().compress(data)
+    elif algo == "brotli":
+        compressed = brotli.compress(data)
+    elif algo == "lz4":
+        compressed = lz4.frame.compress(data)
+    elif algo == "gzip":
+        compressed = gzip.compress(data)
+    elif algo == "bz2":
+        compressed = bz2.compress(data)
+    elif algo == "lzma":
+        compressed = lzma.compress(data)
 
-        result = {
-            "file": os.path.basename(file_path),
-            "type": ftype,
-            "algorithm": algo,
-            "original_size": size,
-            "compressed_size": len(compressed),
-            "compression_ratio": ratio,
-            "comp_time_sec": comp_time,
-            "decomp_time_sec": decomp_time,
-            "entropy": entropy
-        }
-
-    # Append to log
-    with open(log_file, "a") as f:
-        f.write(json.dumps(result) + "\n")
-
-    # Auto recalibration every N files
-    if os.path.getsize(log_file) % recalibrate_every == 0:  # every N entries
-        new_th, acc = auto_recalibrate(log_file)
-        THRESHOLDS = new_th
-        print(f" Recalibrated → {THRESHOLDS} | Accuracy={acc*100:.2f}%")
-
-    return result
+    return compressed, decision
 
 # ----------------------
-# Example Run
+# Threshold Database (Optional Future Use)
 # ----------------------
-if __name__ == "__main__":
-    print(f" Starting with thresholds: {THRESHOLDS}")
-    test_folder = "testdata"
-    for fname in os.listdir(test_folder):
-        fpath = os.path.join(test_folder, fname)
-        adaptive_compress(fpath)
+def init_threshold_db():
+    # Placeholder for DB-based threshold management
+    pass
+
+def log_thresholds(entropy_threshold, size_threshold):
+    log_entry = {
+        "timestamp": time.time(),
+        "entropy_threshold": entropy_threshold,
+        "size_threshold": size_threshold,
+    }
+    with open("adaptive_log.jsonl", "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+
+# ----------------------
+# Auto Recalibration
+# ----------------------
+def auto_recalibrate(window=500, log_file="adaptive_log.jsonl"):
+    """
+    Wrapper to recalibrate thresholds from log or DB.
+    """
+    try:
+        from smartzip_dashboard import auto_recalibrate_from_log
+        thresholds = auto_recalibrate_from_log(log_file=log_file, window=window)
+        if thresholds:
+            return thresholds
+    except ImportError:
+        print("⚠️ Dashboard recalibration not available")
+    except Exception as e:
+        print("⚠️ Auto-recalibration error:", e)
+
+    return load_thresholds()
+
+# ----------------------
+# Catalog Integration
+# ----------------------
+def add_decision_to_catalog(file_name, decision):
+    try:
+        import sqlite3
+        conn = sqlite3.connect("smartzip_catalog.db")
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT,
+                algo TEXT,
+                entropy REAL,
+                size INTEGER,
+                entropy_threshold REAL,
+                size_threshold INTEGER,
+                timestamp REAL
+            )
+        """)
+        c.execute("""
+            INSERT INTO decisions (file_name, algo, entropy, size, entropy_threshold, size_threshold, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            file_name,
+            decision.get("algo"),
+            decision.get("file_entropy"),
+            decision.get("file_size"),
+            decision.get("entropy_threshold"),
+            decision.get("size_threshold"),
+            decision.get("timestamp"),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("⚠️ Failed to log decision to catalog:", e)

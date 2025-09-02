@@ -1,22 +1,37 @@
-from smartzip_catalog import store, query, get
+import sys
+from smartzip_catalog import store, get, query
 
-# 1. Store file into catalog
-entry, comp_file = store("sample.txt", algo="zstd")
-print("Stored:", entry)
-print("Compressed file saved at:", comp_file)
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python catalog_test.py <filename>")
+        return
 
-# 2. Query catalog for all zstd files
-print("\nQuery results (algo=zstd):")
-rows = query({"algo": "zstd"})
-for r in rows:
-    print(r)
+    filename = sys.argv[1]
 
-# 3. Query catalog for low-entropy files (entropy < 4.0)
-print("\nQuery results (entropy < 4.0):")
-rows = query({"entropy<": 4.0})
-for r in rows:
-    print(r)
+    # Store file and get entry
+    entry, comp_file = store(filename)
+    print(f"Stored: {entry}")
+    print(f"👉 Algorithm chosen: {entry['algo']}")
+    print(f"Compressed file saved at: {comp_file}\n")
 
-# 4. Restore file from catalog by ID (first one)
-get(1, "restored_sample.txt")
-print("\nRestored file written to restored_sample.txt")
+    # Query by algo
+    print("Query results (algo=zstd):")
+    for row in query({"algo": "zstd"}):
+        print(row)
+
+    # Query by entropy
+    print("\nQuery results (entropy < 4.0):")
+    for row in query({"entropy<": 4.0}):
+        print(row)
+
+    # Restore test
+    out_path = f"restored_{filename}"
+    try:
+        file_id = entry.get("id", entry["file_name"])   # ✅ prefer id, fallback to filename
+        restored = get(file_id, out_path)
+        print(f"\nRestored file written to {restored}")
+    except Exception as e:
+        print(f"⚠️ Restore failed: {e}")
+
+if __name__ == "__main__":
+    main()
